@@ -1,98 +1,99 @@
+# app.py — Simulated Compounding Strategy from Fixed $1,000
+
 import os, requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ── ENV VARS ────────────────────────────────
-OANDA_API_KEY = os.getenv("OANDA_API_KEY")
+# ── SIMULATION STATE ───────────────────────────────────────────────
+simulated_balance = 1000.00  # starting capital
+open_trade = None            # hold current open position
+
+# ── OANDA SETTINGS (set these in Render environment) ───────────────
+OANDA_API_KEY    = os.getenv("OANDA_API_KEY")
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
+
+if not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
+    raise RuntimeError("Missing OANDA_API_KEY or OANDA_ACCOUNT_ID!")
+
 BASE = f"https://api-fxpractice.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}"
 HEADERS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
     "Content-Type": "application/json"
 }
 
-# ── SETTINGS ────────────────────────────────
-STARTING_BALANCE = 1000  # Use this only for the first trade simulation
-USE_STATIC_BALANCE = True  # Toggle to use fixed $1000 or live balance
+# ── STRATEGY SETTINGS ─────────────────────────────────────────────
+LEVERAGE = 50
+PIP_VALUE_PER_1000 = 0.1   # Approximate pip value for EUR/USD per 1,000 units
+INSTRUMENT = "EUR_USD"
 
-# ── HELPERS ────────────────────────────────
-def get_balance():
-    r = requests.get(f"{BASE}/summary", headers=HEADERS, timeout=10)
+# ── OANDA FUNCTIONS ────────────────────────────────────────────────
+def close_open_trades():
+    r = requests.get(f"{BASE}/openTrades", headers=HEADERS, timeout=10)
     r.raise_for_status()
-    return float(r.json()["account"]["balance"])
+    trades = r.json().get("trades", [])
+    for trade in trades:
+        trade_id = trade["id"]
+        close_url = f"{BASE}/trades/{trade_id}/close"
+        resp = requests.put(close_url, headers=HEADERS)
+        resp.raise_for_status()
+    return len(trades)
 
-def calculate_units(balance):
-    # Full balance used with 1 pip move ($0.0001)
-    units = balance / 0.0001
-    return int(units)
-
-def close_open_positions():
-    r = requests.get(f"{BASE}/openPositions", headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-
-    for position in data.get("positions", []):
-        instrument = position["instrument"]
-        net_units = float(position["long"]["units"]) - float(position["short"]["units"])
-        if net_units != 0:
-            close_side = "short" if net_units > 0 else "long"
-            close_data = {
-                "longUnits": "ALL" if close_side == "long" else "NONE",
-                "shortUnits": "ALL" if close_side == "short" else "NONE"
-            }
-            resp = requests.put(f"{BASE}/positions/{instrument}/close", headers=HEADERS, json=close_data, timeout=10)
-            resp.raise_for_status()
-
-def place_order(units, side):
-    if side == "SELL":
-        units = -abs(units)
-    else:
-        units = abs(units)
-
-    order = {
+def oanda_order(units):
+    data = {
         "order": {
             "units": str(units),
-            "instrument": "EUR_USD",
+            "instrument": INSTRUMENT,
             "timeInForce": "FOK",
             "type": "MARKET",
             "positionFill": "DEFAULT"
         }
     }
-    r = requests.post(f"{BASE}/orders", headers=HEADERS, json=order, timeout=10)
+    r = requests.post(f"{BASE}/orders", headers=HEADERS, json=data, timeout=10)
     r.raise_for_status()
     return r.json()
 
-# ── ROUTES ────────────────────────────────
+# ── MAIN WEBHOOK ───────────────────────────────────────────────────
 @app.route("/", methods=["POST"])
 def webhook():
+    global simulated_balance
+
     data = request.get_json(silent=True) or {}
     try:
         action = data["strategy"]["order_action"].upper()
         assert action in ("BUY", "SELL")
     except Exception:
-        return jsonify(error="Invalid payload"), 400
+        return jsonify(error="Invalid TradingView payload"), 400
 
     try:
-        # Optional: Static balance simulation on first trade
-        balance = STARTING_BALANCE if USE_STATIC_BALANCE else get_balance()
-        units = calculate_units(balance)
-        close_open_positions()  # Make sure no position is open
-        resp_json = place_order(units, action)
+        close_open_trades()
     except Exception as e:
-        return jsonify(error="Execution failed", details=str(e)), 500
+        return jsonify(error="Failed to close trades", details=str(e)), 500
+
+    # calculate maximum position size based on simulated balance
+    margin = simulated_balance
+    max_position = margin * LEVERAGE
+    price = 1.10  # assumed fixed price for simulation
+    units = int(max_position / price)
+    if action == "SELL":
+        units = -units
+
+    try:
+        response = oanda_order(units)
+    except Exception as e:
+        return jsonify(error="Order failed", details=str(e)), 500
 
     return jsonify(
-        message="Order placed",
+        message="Simulated order placed",
         side=action,
         units=units,
-        balance=f"${balance:,.2f}",
-        oanda_response=resp_json
-    ), 200
+        balance=f"${simulated_balance:,.2f}",
+        oanda_response=response
+    )
 
 @app.route("/health")
 def health():
-    return "Webhook live and only one trade at a time ✅", 200
+    return "Webhook running (Simulated $1,000 Compounding Mode)", 200
 
 if __name__ == "__main__":
     app.run(debug=True)
