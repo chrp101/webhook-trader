@@ -1,104 +1,124 @@
-import os, requests, json
+# app.py — Virtual Balance driven by ENV var `OANDA_BASE_BALANCE`
+# -------------------------------------------------------------
+# • Reads starting balance from environment (default $1 000)
+# • Persists virtual balance in balance.json (survives restarts)
+# • Closes any open EUR‑USD trade before new one
+# • Uses 50× leverage on *virtual* balance to size the order
+# -------------------------------------------------------------
+
+import os, json, requests
+from decimal import Decimal, ROUND_DOWN
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ── ENV VARS ─────────────────────────────────────────────
-OANDA_API_KEY    = os.getenv("OANDA_API_KEY")
-OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
+# ── ENV & CONSTANTS ───────────────────────────────────────────
+API_KEY   = os.getenv("OANDA_API_KEY")
+ACCOUNT   = os.getenv("OANDA_ACCOUNT_ID")
+BASE_BAL  = Decimal(os.getenv("OANDA_BASE_BALANCE", "1000"))  # dynamic baseline ✅
+LEVERAGE  = Decimal("50")                                       # leverage to apply
+PAIR      = "EUR_USD"
+BAL_FILE  = "balance.json"
 
-if not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
-    raise RuntimeError("OANDA_API_KEY or OANDA_ACCOUNT_ID not set!")
+if not API_KEY or not ACCOUNT:
+    raise RuntimeError("Missing OANDA_API_KEY or OANDA_ACCOUNT_ID env vars")
 
-BASE = f"https://api-fxpractice.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}"
-HDRS = {
-    "Authorization": f"Bearer {OANDA_API_KEY}",
-    "Content-Type": "application/json"
-}
+BASE_URL = f"https://api-fxpractice.oanda.com/v3/accounts/{ACCOUNT}"
+HEADERS  = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
 
-# ── SIMULATION STATE ─────────────────────────────────────
-BALANCE_FILE = "balance.json"
-START_BALANCE = 1000
+# ── BALANCE PERSISTENCE ───────────────────────────────────────
 
-# ── HELPERS ──────────────────────────────────────────────
-def load_balance():
-    if not os.path.exists(BALANCE_FILE):
-        with open(BALANCE_FILE, "w") as f:
-            json.dump({"balance": START_BALANCE}, f)
-    with open(BALANCE_FILE) as f:
-        return float(json.load(f)["balance"])
+def load_balance() -> Decimal:
+    """Load virtual balance; create file if absent with baseline."""
+    if not os.path.exists(BAL_FILE):
+        save_balance(BASE_BAL)
+    with open(BAL_FILE, "r") as f:
+        return Decimal(json.load(f)["balance"])
 
-def save_balance(new_balance):
-    with open(BALANCE_FILE, "w") as f:
-        json.dump({"balance": round(new_balance, 2)}, f)
+def save_balance(bal: Decimal):
+    with open(BAL_FILE, "w") as f:
+        json.dump({"balance": str(bal.quantize(Decimal("0.01"), ROUND_DOWN))}, f)
 
-def close_all_positions():
-    url = f"{BASE}/positions/EUR_USD/close"
-    body = {"longUnits": "ALL", "shortUnits": "ALL"}
-    r = requests.put(url, headers=HDRS, json=body)
-    return r.ok
+# ── OANDA HELPERS ─────────────────────────────────────────────
 
-def place_order(units):
+def close_position():
+    resp = requests.put(f"{BASE_URL}/positions/{PAIR}/close", headers=HEADERS,
+                        json={"longUnits": "ALL", "shortUnits": "ALL"}, timeout=10)
+    if resp.status_code == 404:
+        return Decimal("0")
+    resp.raise_for_status()
+    pl = Decimal("0")
+    data = resp.json()
+    for side in ("longOrderFillTransaction", "shortOrderFillTransaction"):
+        if side in data and "pl" in data[side]:
+            pl += Decimal(data[side]["pl"])
+    return pl
+
+def get_price() -> Decimal:
+    r = requests.get(f"{BASE_URL.replace('/accounts/', '/pricing')}?instruments={PAIR}", headers=HEADERS, timeout=10)
+    r.raise_for_status()
+    return Decimal(r.json()["prices"][0]["asks"][0]["price"])
+
+def place_order(units: int):
     body = {
         "order": {
             "units": str(units),
-            "instrument": "EUR_USD",
+            "instrument": PAIR,
             "timeInForce": "FOK",
             "type": "MARKET",
             "positionFill": "DEFAULT"
         }
     }
-    r = requests.post(f"{BASE}/orders", headers=HDRS, json=body)
+    r = requests.post(f"{BASE_URL}/orders", headers=HEADERS, json=body, timeout=10)
     r.raise_for_status()
     return r.json()
 
-def get_latest_trade_pl():
-    r = requests.get(f"{BASE}/trades", headers=HDRS)
-    r.raise_for_status()
-    trades = r.json().get("trades", [])
-    if not trades:
-        return 0
-    latest = max(trades, key=lambda t: t["openTime"])
-    return float(latest.get("unrealizedPL", 0))
-
-# ── ROUTES ───────────────────────────────────────────────
+# ── ROUTES ───────────────────────────────────────────────────
 @app.route("/", methods=["POST"])
 def webhook():
-    data = request.get_json(silent=True) or {}
+    payload = request.get_json(silent=True) or {}
     try:
-        action = data["strategy"]["order_action"].upper()
-        assert action in ("BUY", "SELL")
+        side = payload["strategy"]["order_action"].upper()
+        assert side in ("BUY", "SELL")
     except Exception:
-        return jsonify(error="Invalid signal payload"), 400
+        return jsonify(error="Invalid TradingView payload"), 400
 
-    # Close existing trades to prevent overlap
-    close_all_positions()
+    # 1. Close existing position and update virtual balance
+    realized_pl = close_position()
+    virt_balance = load_balance() + realized_pl
+    save_balance(virt_balance)
 
-    # Use simulated balance only
-    sim_balance = load_balance()
-    entry_price = 1.17  # approximation; could be fetched live for precision
-    margin_per_unit = 0.02  # estimated margin needed per unit
-    max_units = int(sim_balance / margin_per_unit)
+    # 2. Calculate units from virtual balance only
+    price   = get_price()
+    notional= virt_balance * LEVERAGE
+    units   = int((notional / price).quantize(Decimal("1")))
+    if side == "SELL":
+        units = -units
 
-    if max_units < 100:
-        return jsonify(error="Balance too low to trade"), 400
+    if abs(units) < 100:  # minimum trade size guard
+        return jsonify(error="Virtual balance too small for trade", balance=str(virt_balance)), 400
 
-    units = max_units if action == "BUY" else -max_units
+    # 3. Place order
     try:
-        resp = place_order(units)
-    except requests.HTTPError as e:
-        return jsonify(error="Order failed", details=e.response.json()), 500
+        oanda_resp = place_order(units)
+    except Exception as e:
+        return jsonify(error="Order failed", details=str(e)), 500
 
-    save_balance(sim_balance)  # temporary until profit realized
-    return jsonify(message="Order placed",
-                   side=action,
-                   units=units,
-                   balance=f"${sim_balance:,.2f}",
-                   oanda_response=resp), 200
+    return jsonify(
+        message          = "Order placed",
+        side             = side,
+        units            = units,
+        virtual_balance  = str(virt_balance),
+        leverage         = str(LEVERAGE),
+        notional_value   = f"{(notional):.2f}",
+        entry_price      = str(price),
+        pl_from_close    = str(realized_pl),
+        oanda_response   = oanda_resp
+    ), 200
 
 @app.route("/health")
 def health():
-    return "Compounding bot is running ✅", 200
+    return f"Bot live | virtual balance: {load_balance()} USD", 200
 
 if __name__ == "__main__":
     app.run(debug=True)
