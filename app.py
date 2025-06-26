@@ -1,52 +1,62 @@
-# app.py  (compounding + live balance)
+# app.py (Compounding using FULL BALANCE per trade, no SL)
 
 import os, requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ── ENV VARS (set in Render) ─────────────────────────────────────
-OANDA_API_KEY   = os.getenv("OANDA_API_KEY")        # practice token
-OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")    # 101-xxx-…-001
+# ── ENV VARS (Render secrets) ─────────────────────────────
+OANDA_API_KEY = os.getenv("OANDA_API_KEY")
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 
 if not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
     raise RuntimeError("OANDA_API_KEY or OANDA_ACCOUNT_ID not set!")
 
-BASE = f"https://api-fxpractice.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}"
-HDRS = {"Authorization": f"Bearer {OANDA_API_KEY}",
-        "Content-Type": "application/json"}
+BASE_URL = f"https://api-fxpractice.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}"
+HEADERS = {
+    "Authorization": f"Bearer {OANDA_API_KEY}",
+    "Content-Type": "application/json"
+}
 
-# ── RISK SETTINGS ────────────────────────────────────────────────
-RISK_USD        = 100      # dollars you’re willing to lose per trade
-STOP_PIPS       = 100      # assumed SL distance
-UNIT_STEP       = 100      # round units to nearest 100
+# ── CONFIG ───────────────────────────────────────────────
+MAX_LEVERAGE = 20      # OANDA default margin leverage
+UNIT_STEP = 100        # round units to nearest 100
+PAIR = "EUR_USD"
+PIP_SIZE = 0.0001      # for EUR/USD
 
-# ── HELPERS ──────────────────────────────────────────────────────
-def balance():
-    r = requests.get(f"{BASE}/summary", headers=HDRS, timeout=10)
+# ── UTILS ────────────────────────────────────────────────
+def fetch_balance():
+    r = requests.get(f"{BASE_URL}/summary", headers=HEADERS, timeout=10)
     r.raise_for_status()
     return float(r.json()["account"]["balance"])
 
-def units_for_risk():
-    pip_value_needed = RISK_USD / STOP_PIPS        # $ / pip
-    units = pip_value_needed / 0.0001              # for EURUSD
-    return int(round(units / UNIT_STEP) * UNIT_STEP) or UNIT_STEP
+def calculate_max_units(balance: float, price: float) -> int:
+    # Assume using full balance with max leverage
+    notional = balance * MAX_LEVERAGE
+    units = notional / price
+    return int(round(units / UNIT_STEP) * UNIT_STEP)
 
-def oanda_order(units: int):
+def fetch_price(side: str) -> float:
+    r = requests.get(f"{BASE_URL.replace('/accounts/', '/pricing')}?instruments={PAIR}", headers=HEADERS)
+    r.raise_for_status()
+    prices = r.json()["prices"][0]
+    return float(prices["asks"][0]["price"] if side == "buy" else prices["bids"][0]["price"])
+
+def send_order(units: int):
     order = {
         "order": {
             "units": str(units),
-            "instrument": "EUR_USD",
+            "instrument": PAIR,
             "timeInForce": "FOK",
             "type": "MARKET",
             "positionFill": "DEFAULT"
         }
     }
-    r = requests.post(f"{BASE}/orders", headers=HDRS, json=order, timeout=10)
+    r = requests.post(f"{BASE_URL}/orders", headers=HEADERS, json=order, timeout=10)
     r.raise_for_status()
     return r.json()
 
-# ── ROUTES ───────────────────────────────────────────────────────
+# ── ROUTES ───────────────────────────────────────────────
 @app.route("/", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
@@ -57,30 +67,28 @@ def webhook():
         return jsonify(error="Invalid payload"), 400
 
     try:
-        bal_before = balance()
+        balance = fetch_balance()
+        side = "buy" if action == "BUY" else "sell"
+        price = fetch_price(side)
+        units = calculate_max_units(balance, price)
+        if side == "sell":
+            units = -units
+        response = send_order(units)
     except Exception as e:
-        return jsonify(error="Cannot fetch balance", details=str(e)), 500
+        return jsonify(error="Execution failed", details=str(e)), 500
 
-    units = units_for_risk()
-    if action == "SELL":
-        units = -units
-
-    try:
-        resp_json = oanda_order(units)
-    except requests.HTTPError as e:
-        return jsonify(error="Order failed", details=e.response.json()), e.response.status_code
-
-    return jsonify(
-        message="Order placed",
-        side=action,
-        units=units,
-        balance_before=f"{bal_before:.2f}",
-        oanda_response=resp_json
-    ), 200
+    return jsonify({
+        "message": "Order placed",
+        "side": action,
+        "units": units,
+        "balance_used": f"${balance:.2f}",
+        "entry_price": price,
+        "response": response
+    }), 200
 
 @app.route("/health")
 def health():
-    return "Webhook up & compounding ✅", 200
+    return "Webhook live & compounding ✅", 200
 
 if __name__ == "__main__":
     app.run(debug=True)
