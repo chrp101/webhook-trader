@@ -6,8 +6,8 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # ▸ READ SECRETS FROM ENV  (do **not** put the real string here)
-OANDA_API_KEY   = os.getenv("a43082971ce6143beff20a4a5f17c57d-b23f0b5264cea54363dd610e1ee406df")       # <-- just the var name
-OANDA_ACCOUNT_ID = os.getenv("101-001-35645176-001")   # e.g. 101-001-1234567-001
+OANDA_API_KEY   = os.getenv("OANDA_API_KEY")       # <-- just the var name
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")   # e.g. 101-001-1234567-001
 
 # sanity-check at start-up (will show in Render logs)
 if not all([OANDA_API_KEY, OANDA_ACCOUNT_ID]):
@@ -56,6 +56,3 @@ def health():
 
 if __name__ == "__main__":
     app.run(debug=True)
-
-
-
