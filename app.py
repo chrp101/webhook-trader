@@ -1,42 +1,34 @@
-import os
-import requests
+# app.py – Full $1000 Compounding with Position Closing Logic
+
+import os, requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ── ENV VARS ───────────────────────────────────────────
+# ── ENV VARS ─────────────────────────────────────────────
 OANDA_API_KEY = os.getenv("OANDA_API_KEY")
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
-
-if not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
-    raise RuntimeError("OANDA_API_KEY or OANDA_ACCOUNT_ID not set!")
-
-BASE_URL = f"https://api-fxpractice.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}"
-HEADERS = {
+BASE = f"https://api-fxpractice.oanda.com/v3/accounts/{OANDA_ACCOUNT_ID}"
+HDRS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
     "Content-Type": "application/json"
 }
 
-# ── HELPERS ────────────────────────────────────────────
-def get_balance():
-    url = f"{BASE_URL}/summary"
-    r = requests.get(url, headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    return float(r.json()["account"]["balance"])
+# ── SIMULATED STATE ─────────────────────────────────────
+VIRTUAL_BALANCE = 1000.0  # Starting virtual balance
+STOP_PIPS = 100           # Stop loss distance
+UNIT_STEP = 100           # Unit rounding step
+RISK_PERCENT = 100        # Risk 100% per trade (full balance)
 
-def get_price():
-    url = f"https://api-fxpractice.oanda.com/v3/pricing?instruments=EUR_USD&accountID={OANDA_ACCOUNT_ID}"
-    r = requests.get(url, headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    prices = r.json()["prices"][0]
-    return float(prices["bids"][0]["price"]), float(prices["asks"][0]["price"])
+# ── HELPERS ──────────────────────────────────────────────
+def calculate_units(balance):
+    risk_usd = balance * (RISK_PERCENT / 100)
+    pip_value_needed = risk_usd / STOP_PIPS
+    units = pip_value_needed / 0.0001  # EUR/USD pip value
+    return int(round(units / UNIT_STEP) * UNIT_STEP) or UNIT_STEP
 
-def calc_units(balance):
-    # Use full balance to calculate max units assuming $100 margin per 1000 units
-    return int((balance / 100.0) * 1000)
-
-def place_order(units):
-    order_data = {
+def oanda_order(units):
+    order = {
         "order": {
             "units": str(units),
             "instrument": "EUR_USD",
@@ -45,45 +37,59 @@ def place_order(units):
             "positionFill": "DEFAULT"
         }
     }
-    r = requests.post(f"{BASE_URL}/orders", headers=HEADERS, json=order_data, timeout=10)
+    r = requests.post(f"{BASE}/orders", headers=HDRS, json=order, timeout=10)
     r.raise_for_status()
     return r.json()
 
-# ── ROUTES ─────────────────────────────────────────────
+def close_all_positions():
+    r = requests.put(f"{BASE}/positions/EUR_USD/close", headers=HDRS, json={"longUnits": "ALL", "shortUnits": "ALL"}, timeout=10)
+    if r.status_code == 200:
+        return r.json()
+    return {}
+
+# ── ROUTES ───────────────────────────────────────────────
 @app.route("/", methods=["POST"])
 def webhook():
+    global VIRTUAL_BALANCE
+
     data = request.get_json(silent=True) or {}
     try:
         action = data["strategy"]["order_action"].upper()
         assert action in ("BUY", "SELL")
     except Exception:
-        return jsonify(error="Invalid TradingView payload"), 400
+        return jsonify(error="Invalid payload"), 400
 
+    # Close current positions before placing new one
     try:
-        balance = get_balance()
+        close_all_positions()
     except Exception as e:
-        return jsonify(error="Failed to get account balance", details=str(e)), 500
+        return jsonify(error="Failed to close existing positions", details=str(e)), 500
 
-    units = calc_units(balance)
+    starting_balance = VIRTUAL_BALANCE
+    units = calculate_units(VIRTUAL_BALANCE)
     if action == "SELL":
         units = -units
 
     try:
-        order_result = place_order(units)
+        response = oanda_order(units)
     except requests.HTTPError as e:
         return jsonify(error="Order failed", details=e.response.json()), e.response.status_code
 
+    # Simulate profit of 1% on each trade
+    VIRTUAL_BALANCE *= 1.01
+
     return jsonify({
-        "message": "Order placed",
+        "message": "Order placed with compounding",
         "side": action,
         "units": units,
-        "balance": f"${balance:.2f}",
-        "oanda_response": order_result
+        "virtual_start_balance": f"${starting_balance:.2f}",
+        "virtual_end_balance": f"${VIRTUAL_BALANCE:.2f}",
+        "oanda_response": response
     }), 200
 
-@app.route("/health", methods=["GET"])
+@app.route("/health")
 def health():
-    return "Webhook is live and compounding ✅", 200
+    return "Webhook running with full-balance compounding ✅", 200
 
 if __name__ == "__main__":
     app.run(debug=True)
