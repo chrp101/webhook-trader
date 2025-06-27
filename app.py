@@ -1,10 +1,9 @@
-# app.py — Virtual-balance compounding bot (Fixed close_position)
-# -------------------------------------------------------
-# • Reads OANDA_BASE_BALANCE for virtual starting balance
-# • Persists balance + trade log
-# • Closes only the active side of the position
-# • True compounding: next trade uses full realized balance
-# -------------------------------------------------------
+# app.py — Virtual-balance compounding bot with profit exit threshold
+# -------------------------------------------------------------------
+# • Uses OANDA_BASE_BALANCE as starting balance
+# • Takes profit if unrealized P/L >= PROFIT_TARGET
+# • True compounding: full balance rolls into next trade
+# -------------------------------------------------------------------
 
 import os, json, requests, logging
 from decimal import Decimal, ROUND_DOWN
@@ -14,17 +13,17 @@ from datetime import datetime
 # ── Configure logging ───────────────────────────────────
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
 app = Flask(__name__)
 
 # ── ENV + CONSTANTS ─────────────────────────────────────
-API_KEY   = os.getenv("OANDA_API_KEY")
-ACCOUNT   = os.getenv("OANDA_ACCOUNT_ID")
-BASE_BAL  = Decimal(os.getenv("OANDA_BASE_BALANCE", "1000"))
-LEVERAGE  = Decimal("50")              # Buying power multiplier
-PAIR      = "EUR_USD"
-BAL_FILE  = "balance.json"
-TRADE_LOG = "trades.json"
+API_KEY        = os.getenv("OANDA_API_KEY")
+ACCOUNT        = os.getenv("OANDA_ACCOUNT_ID")
+BASE_BAL       = Decimal(os.getenv("OANDA_BASE_BALANCE", "1000"))
+LEVERAGE       = Decimal("50")
+PROFIT_TARGET  = Decimal(os.getenv("PROFIT_TARGET", "10"))  # ✅ New dynamic threshold
+PAIR           = "EUR_USD"
+BAL_FILE       = "balance.json"
+TRADE_LOG      = "trades.json"
 
 if not API_KEY or not ACCOUNT:
     raise RuntimeError("OANDA_API_KEY or OANDA_ACCOUNT_ID missing")
@@ -108,7 +107,7 @@ def close_position() -> Decimal:
     return realized
 
 def get_current_price() -> Decimal:
-    url = f"https://api-fxpractice.oanda.com/v3/accounts/{ACCOUNT}/pricing?instruments={PAIR}"
+    url = f"{BASE_URL}/pricing?instruments={PAIR}"
     r = requests.get(url, headers=HEADERS, timeout=10)
     r.raise_for_status()
     price_data = r.json()["prices"][0]
@@ -119,7 +118,15 @@ def get_current_price() -> Decimal:
     return mid
 
 def place_market_order(units: int) -> dict:
-    body = {"order": {"units": str(units), "instrument": PAIR, "timeInForce": "FOK", "type": "MARKET", "positionFill": "DEFAULT"}}
+    body = {
+        "order": {
+            "units": str(units),
+            "instrument": PAIR,
+            "timeInForce": "FOK",
+            "type": "MARKET",
+            "positionFill": "DEFAULT"
+        }
+    }
     logger.info(f"Placing order units={units}")
     r = requests.post(f"{BASE_URL}/orders", headers=HEADERS, json=body, timeout=10)
     r.raise_for_status()
@@ -138,16 +145,31 @@ def execute_trade(side: str) -> dict:
     logger.info(f"=== EXECUTE {side} ===")
     bal = load_balance()
     logger.info(f"Bal before close={bal}")
-    realized = close_position()
-    new_bal = bal + realized
-    save_balance(new_bal)
-    logger.info(f"Bal after close={new_bal}")
-    if new_bal <= Decimal("100"): raise ValueError("Balance too low")
+
+    # 🟡 Check profit threshold first
+    pos = get_current_position()
+    if pos and pos["unrealized_pl"] >= PROFIT_TARGET:
+        logger.info(f"Unrealized P/L {pos['unrealized_pl']} >= {PROFIT_TARGET} → closing position")
+        realized = close_position()
+        bal += realized
+        save_balance(bal)
+    else:
+        logger.info(f"No profit target met or no position open.")
+
     price = get_current_price()
-    units = calculate_position_size(new_bal, price, side)
-    if abs(units) < 100: raise ValueError("Units too small")
+    units = calculate_position_size(bal, price, side)
+    if abs(units) < 100:
+        raise ValueError("Units too small")
+
     resp = place_market_order(units)
-    trade_data = {"side": side, "units": units, "entry_price": str(price), "virtual_balance_before": str(bal), "realized_pl": str(realized), "virtual_balance_after": str(new_bal)}
+    trade_data = {
+        "side": side,
+        "units": units,
+        "entry_price": str(price),
+        "virtual_balance_before": str(bal),
+        "realized_pl": str(pos['unrealized_pl']) if pos else "0",
+        "virtual_balance_after": str(bal)
+    }
     log_trade(trade_data)
     return {**trade_data, "oanda_response": resp, "message": f"Executed {side}"}
 
@@ -157,18 +179,18 @@ def webhook():
     payload = request.get_json(silent=True) or {}
     try:
         side = payload["strategy"]["order_action"].upper()
-        if side not in ("BUY","SELL"): raise ValueError
+        if side not in ("BUY", "SELL"): raise ValueError
     except Exception:
-        return jsonify(error="Invalid payload"),400
+        return jsonify(error="Invalid payload"), 400
     try:
         result = execute_trade(side)
-        return jsonify(result),200
+        return jsonify(result), 200
     except ValueError as e:
         logger.warning(e)
-        return jsonify(error=str(e)),400
+        return jsonify(error=str(e)), 400
     except Exception as e:
         logger.error(e)
-        return jsonify(error="Trade failed", details=str(e)),500
+        return jsonify(error="Trade failed", details=str(e)), 500
 
 @app.route("/status")
 def status():
@@ -176,22 +198,22 @@ def status():
         vb = load_balance()
         pos = get_current_position()
         price = get_current_price()
-        return jsonify(virtual_balance=str(vb), current_price=str(price), position=pos),200
+        return jsonify(virtual_balance=str(vb), current_price=str(price), position=pos), 200
     except Exception as e:
-        return jsonify(error=str(e)),500
+        return jsonify(error=str(e)), 500
 
 @app.route("/health")
 def health():
     try:
-        return f"Alive | balance={load_balance()}",200
+        return f"Alive | balance={load_balance()}", 200
     except Exception as e:
-        return str(e),500
+        return str(e), 500
 
 @app.route("/reset", methods=["POST"])
 def reset_balance():
     save_balance(BASE_BAL)
-    return jsonify(message=f"Reset to {BASE_BAL}"),200
+    return jsonify(message=f"Reset to {BASE_BAL}"), 200
 
 if __name__ == "__main__":
-    logger.info(f"Starting bot base={BASE_BAL} lev={LEVERAGE}")
-    app.run(debug=True, port=int(os.getenv("PORT",5000)))
+    logger.info(f"Starting bot base={BASE_BAL} lev={LEVERAGE}, profit_target={PROFIT_TARGET}")
+    app.run(debug=True, port=int(os.getenv("PORT", 5000)))
