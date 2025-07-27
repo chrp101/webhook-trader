@@ -1,12 +1,3 @@
-# app.py — OANDA × TradingView Bot (Full Cycle)
-# -------------------------------------------------------
-# ✅ Buy/Sell via TradingView alerts
-# ✅ Uses full balance with compounding
-# ✅ Stop-loss & take-profit in pips (optional)
-# ✅ Short + long position support
-# ✅ Optional multi-symbol support
-# -------------------------------------------------------
-
 import os, json, requests, logging
 from flask import Flask, request, jsonify
 from decimal import Decimal, ROUND_DOWN
@@ -19,8 +10,8 @@ OANDA_API_KEY      = os.getenv("OANDA_API_KEY")
 ACCOUNT_ID         = os.getenv("OANDA_ACCOUNT_ID")
 DEFAULT_PAIR       = os.getenv("OANDA_DEFAULT_PAIR", "EUR_USD")
 LEVERAGE           = Decimal(os.getenv("OANDA_LEVERAGE", "50"))
-TAKE_PROFIT_PIPS   = Decimal(os.getenv("OANDA_TP_PIPS", "0"))  # Set to 0 to disable
-STOP_LOSS_PIPS     = Decimal(os.getenv("OANDA_SL_PIPS", "0"))  # Set to 0 to disable
+TAKE_PROFIT_PIPS   = Decimal(os.getenv("OANDA_TP_PIPS", "0"))
+STOP_LOSS_PIPS     = Decimal(os.getenv("OANDA_SL_PIPS", "0"))
 
 if not OANDA_API_KEY or not ACCOUNT_ID:
     raise RuntimeError("Missing OANDA_API_KEY or OANDA_ACCOUNT_ID")
@@ -44,12 +35,26 @@ def get_balance():
     data = r.json()
     return Decimal(data["account"]["balance"])
 
+def get_open_position(pair):
+    url = f"{BASE_URL}/openPositions"
+    r = requests.get(url, headers=HEADERS, timeout=10)
+    if r.status_code != 200:
+        return Decimal("0")
+
+    data = r.json()
+    for pos in data.get("positions", []):
+        if pos["instrument"] == pair:
+            long_units = Decimal(pos["long"]["units"])
+            short_units = Decimal(pos["short"]["units"])
+            return long_units - short_units
+    return Decimal("0")
+
 def close_all_positions(pair):
-    r = requests.put(f"{BASE_URL}/positions/{pair}/close", headers=HEADERS, json={"longUnits":"ALL", "shortUnits":"ALL"})
+    r = requests.put(f"{BASE_URL}/positions/{pair}/close", headers=HEADERS,
+                     json={"longUnits": "ALL", "shortUnits": "ALL"})
     if r.status_code not in (200, 201):
         logging.warning("No position to close or already flat.")
 
-# ── ORDER CREATION ─────────────────────────────────────
 def place_order(pair: str, units: int, price: Decimal):
     order = {
         "order": {
@@ -60,15 +65,13 @@ def place_order(pair: str, units: int, price: Decimal):
             "positionFill": "DEFAULT"
         }
     }
+
     if STOP_LOSS_PIPS > 0 or TAKE_PROFIT_PIPS > 0:
         sl = str((STOP_LOSS_PIPS / 10000).quantize(Decimal("0.00001")))
         tp = str((TAKE_PROFIT_PIPS / 10000).quantize(Decimal("0.00001")))
-        if units > 0:
-            order["order"]["stopLossOnFill"] = {"distance": sl}
-            order["order"]["takeProfitOnFill"] = {"distance": tp}
-        else:
-            order["order"]["stopLossOnFill"] = {"distance": sl}
-            order["order"]["takeProfitOnFill"] = {"distance": tp}
+        order["order"]["stopLossOnFill"] = {"distance": sl}
+        order["order"]["takeProfitOnFill"] = {"distance": tp}
+
     r = requests.post(f"{BASE_URL}/orders", headers=HEADERS, json=order)
     r.raise_for_status()
     return r.json()
@@ -90,12 +93,25 @@ def webhook():
         return jsonify({"error": "Invalid signal"}), 400
 
     try:
-        close_all_positions(pair)
+        current_position = get_open_position(pair)
+        if (side == "BUY" and current_position > 0) or (side == "SELL" and current_position < 0):
+            logging.info("Already in desired position. No action taken.")
+            return jsonify({"status": "Already in position", "pair": pair}), 200
+
+        if current_position != 0:
+            close_all_positions(pair)
+
         price = get_price(pair)
         balance = get_balance()
         units = calculate_units(balance, price, side)
         response = place_order(pair, units, price)
-        return jsonify({"status": f"Executed {side}", "units": units, "pair": pair}), 200
+
+        return jsonify({
+            "status": f"Executed {side}",
+            "units": units,
+            "pair": pair
+        }), 200
+
     except Exception as e:
         logging.exception("Trade failed")
         return jsonify({"error": str(e)}), 500
