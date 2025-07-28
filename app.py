@@ -1,4 +1,3 @@
-# app.py
 import os
 from flask import Flask, request, jsonify
 from oandapyV20 import API
@@ -6,13 +5,13 @@ from oandapyV20.endpoints.accounts import AccountSummary
 from oandapyV20.endpoints.pricing import PricingInfo
 from oandapyV20.endpoints.orders import OrderCreate
 
-# ——— Configuration from env vars —————————————————————————————————————
-OANDA_API_KEY      = os.getenv("OANDA_API_KEY")
-OANDA_ACCOUNT_ID   = os.getenv("OANDA_ACCOUNT_ID")
-RESERVE_RATIO      = float(os.getenv("OANDA_RESERVE_RATIO", 0.2))
+# Load environment variables
+OANDA_API_KEY    = os.getenv("OANDA_API_KEY")
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
+RESERVE_RATIO    = float(os.getenv("OANDA_RESERVE_RATIO", 0.2))  # 20% reserved for short trades
 
 if not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
-    raise RuntimeError("Missing OANDA_API_KEY or OANDA_ACCOUNT_ID env vars")
+    raise RuntimeError("OANDA_API_KEY and OANDA_ACCOUNT_ID must be set as environment variables.")
 
 client = API(access_token=OANDA_API_KEY, environment="live")  # or "practice"
 
@@ -20,62 +19,63 @@ app = Flask(__name__)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(force=True)
-    side       = data.get("side", "").lower()      # expect "buy" or "sell"
-    instrument = data.get("symbol") or data.get("ticker")
-    if side not in ("buy", "sell") or not instrument:
-        return jsonify({"error": "malformed payload"}), 400
+    try:
+        data = request.get_json(force=True)
+        print("Webhook received:", data)
 
-    # 1) Fetch account summary to see how much margin you have available
-    acct_req = AccountSummary(accountID=OANDA_ACCOUNT_ID)
-    acct_resp = client.request(acct_req)["account"]
-    margin_available = float(acct_resp["marginAvailable"])
+        # Accept either 'side' or 'signal'
+        side = data.get("side", "").lower() or data.get("signal", "").lower()
+        instrument = data.get("symbol") or data.get("ticker") or "EUR_USD"
 
-    # 2) Fetch latest price for your instrument
-    pricing_req = PricingInfo(
-        accountID=OANDA_ACCOUNT_ID,
-        params={ "instruments": instrument }
-    )
-    px = client.request(pricing_req)["prices"][0]
-    price = float(px["asks"][0]["price"] if side=="buy" else px["bids"][0]["price"])
+        if side not in ("buy", "sell"):
+            return jsonify({"error": "missing or invalid 'side'/'signal'"}), 400
 
-    # 3) Determine what fraction of margin to use
-    use_frac = 1.0 if side == "buy" else (1.0 - RESERVE_RATIO)
-    alloc_margin = margin_available * use_frac
+        # Fetch account margin
+        acct_summary = AccountSummary(accountID=OANDA_ACCOUNT_ID)
+        acct_data = client.request(acct_summary)["account"]
+        margin_available = float(acct_data["marginAvailable"])
 
-    # 4) Compute units = how many base-currency units you can buy/sell
-    units = int(alloc_margin / price)
-    if units < 1:
-        return jsonify({
-            "error": "insufficient funds",
-            "details": {
+        # Fetch latest price
+        pricing = PricingInfo(accountID=OANDA_ACCOUNT_ID, params={"instruments": instrument})
+        price_data = client.request(pricing)["prices"][0]
+        price = float(price_data["asks"][0]["price"] if side == "buy" else price_data["bids"][0]["price"])
+
+        # Determine how much to use
+        margin_to_use = margin_available * (1.0 if side == "buy" else (1.0 - RESERVE_RATIO))
+        units = int(margin_to_use / price)
+
+        if units < 1:
+            return jsonify({
+                "error": "insufficient funds to open position",
                 "margin_available": margin_available,
-                "allocated_margin": alloc_margin,
-                "price": price
+                "price": price,
+                "units": units
+            }), 400
+
+        # Place order
+        order_data = {
+            "order": {
+                "instrument": instrument,
+                "units": str(units if side == "buy" else -units),
+                "type": "MARKET",
+                "positionFill": "DEFAULT"
             }
-        }), 400
-
-    # 5) Create market order: positive units for buy, negative for sell
-    order_data = {
-        "order": {
-            "instrument": instrument,
-            "units": str(units if side=="buy" else -units),
-            "type": "MARKET",
-            "positionFill": "DEFAULT"
         }
-    }
-    order_req = OrderCreate(accountID=OANDA_ACCOUNT_ID, data=order_data)
-    order_resp = client.request(order_req)
+        order_request = OrderCreate(accountID=OANDA_ACCOUNT_ID, data=order_data)
+        response = client.request(order_request)
 
-    return jsonify({
-        "status":     "order placed",
-        "side":       side,
-        "instrument": instrument,
-        "units":      units,
-        "price":      price,
-        "order":      order_resp.get("orderCreateTransaction", {})
-    }), 200
+        return jsonify({
+            "status": "order placed",
+            "side": side,
+            "instrument": instrument,
+            "units": units,
+            "price": price,
+            "response": response.get("orderCreateTransaction", {})
+        }), 200
+
+    except Exception as e:
+        print("Error:", str(e))
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    # Render.com will use `gunicorn app:app`—this is just for local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
