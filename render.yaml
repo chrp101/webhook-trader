@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: webhook-trader
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -k uvicorn.workers.UvicornWorker app:app
+    envVars:
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_BASE_URL
+        sync: false
+      - key: DEFAULT_SYMBOL
+        value: ETHUSDT
+      - key: ORDER_TIME_IN_FORCE
+        value: gtc
+      - key: SAFETY_BUFFER_PCT
+        value: "0.99"
+      - key: FRACTIONAL_SHARES
+        value: "true"
+      - key: CLOSE_ALL_ON_BUY
+        value: "false"
+      - key: CRYPTO_QTY_DECIMALS
+        value: "6"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: WEBHOOK_SECRET
+        sync: false
