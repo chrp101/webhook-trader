@@ -1,143 +1,242 @@
-# app.py — OANDA × TradingView Bot (Reserve-Aware)
-# -------------------------------------------------------
-# ✅ Full margin BUY, reserved margin SELL
-# ✅ Supports multiple pairs
-# ✅ TP/SL in pips (optional)
-# ✅ Logging + exception handling
-# -------------------------------------------------------
+import os, hmac, hashlib, json, logging, math, time
+from typing import Optional, Dict, Any
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel, Field
+import uvicorn
 
-import os
-import json
-import logging
-from decimal import Decimal, ROUND_DOWN
+# ---- Logging ----
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("tv-alpaca-bot")
 
-import requests
-from flask import Flask, request, jsonify
+# ---- Env ----
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
+ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET", "")
+ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # shared with TradingView alert
+DEFAULT_SYMBOL = os.getenv("DEFAULT_SYMBOL", "ETHUSD")
+SAFETY_BUFFER_PCT = float(os.getenv("SAFETY_BUFFER_PCT", "0.99"))  # use 99% of cash by default
+TIME_IN_FORCE = os.getenv("ORDER_TIME_IN_FORCE", "gtc").upper()    # GTC/IOC/FOK
+FRACTIONAL_SHARES = os.getenv("FRACTIONAL_SHARES", "true").lower() == "true"
+CLOSE_ALL_ON_BUY = os.getenv("CLOSE_ALL_ON_BUY", "false").lower() == "true"
+CRYPTO_QTY_DECIMALS = int(os.getenv("CRYPTO_QTY_DECIMALS", "6"))
+PORT = int(os.getenv("PORT", "8000"))
 
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
+# ---- Alpaca SDK ----
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.enums import QueryOrderStatus
 
-# ── ENV VARIABLES ──────────────────────────────────────
-OANDA_API_KEY    = os.getenv("OANDA_API_KEY")
-ACCOUNT_ID       = os.getenv("OANDA_ACCOUNT_ID")
-DEFAULT_PAIR     = os.getenv("OANDA_DEFAULT_PAIR", "EUR_USD")
-LEVERAGE         = Decimal(os.getenv("OANDA_LEVERAGE", "50"))
-RESERVE_RATIO    = Decimal(os.getenv("OANDA_RESERVE_RATIO", "0.2"))   # Reserve 20% on shorts
-TAKE_PROFIT_PIPS = Decimal(os.getenv("OANDA_TP_PIPS", "0"))
-STOP_LOSS_PIPS   = Decimal(os.getenv("OANDA_SL_PIPS", "0"))
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.historical.crypto import CryptoHistoricalDataClient
+from alpaca.data.requests import StockLatestTradeRequest, CryptoLatestTradeRequest
 
-if not OANDA_API_KEY or not ACCOUNT_ID:
-    raise RuntimeError("Missing OANDA_API_KEY or OANDA_ACCOUNT_ID")
+trading = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper="paper" in ALPACA_BASE_URL)
+stock_data = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
+crypto_data = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
 
-BASE_URL = f"https://api-fxpractice.oanda.com/v3/accounts/{ACCOUNT_ID}"
-HEADERS  = {
-    "Authorization": f"Bearer {OANDA_API_KEY}",
-    "Content-Type": "application/json"
-}
+app = FastAPI(title="TradingView → Alpaca Bot")
 
-# ── HELPERS ─────────────────────────────────────────────
-def get_price(pair: str) -> Decimal:
-    url = f"{BASE_URL}/pricing?instruments={pair}"
-    r = requests.get(url, headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    price_data = r.json()["prices"][0]
-    bid = Decimal(price_data["bids"][0]["price"])
-    ask = Decimal(price_data["asks"][0]["price"])
-    return (bid + ask) / 2
+# In-memory idempotency cache (per-process). Use a DB/Redis for multi-instance deployments.
+PROCESSED_IDS = {}
+IDEMPOTENCY_TTL_SEC = 60 * 10  # 10 minutes
 
-def get_balance() -> Decimal:
-    r = requests.get(BASE_URL, headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    return Decimal(r.json()["account"]["balance"])
 
-def close_all_positions(pair: str):
-    r = requests.put(
-        f"{BASE_URL}/positions/{pair}/close",
-        headers=HEADERS,
-        json={"longUnits": "ALL", "shortUnits": "ALL"},
-        timeout=10
-    )
-    if r.status_code not in (200, 201):
-        logging.warning("No position to close or already flat: %s", r.text)
+def is_crypto_symbol(symbol: str) -> bool:
+    s = symbol.upper()
+    # Alpaca crypto commonly uses e.g., BTCUSD, ETHUSD
+    return s.endswith("USD") or "/" in s
 
-def calculate_units(balance: Decimal, price: Decimal, side: str) -> int:
+
+def get_latest_price(symbol: str) -> float:
+    s = symbol.upper()
+    if is_crypto_symbol(s):
+        req = CryptoLatestTradeRequest(symbol_or_symbols=s)
+        trade = crypto_data.get_latest_trade(req)
+    else:
+        req = StockLatestTradeRequest(symbol_or_symbols=s)
+        trade = stock_data.get_latest_trade(req)
+    # SDK returns dict for multi-symbol; normalize
+    if isinstance(trade, dict):
+        trade = trade[s]
+    return float(trade.price)
+
+
+def get_cash_available() -> float:
+    acct = trading.get_account()
+    return float(acct.cash)
+
+
+def cancel_open_orders_for_symbol(symbol: str):
+    req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+    open_orders = trading.get_orders(filter=req)
+    for o in open_orders:
+        if o.symbol.upper() == symbol.upper():
+            try:
+                trading.cancel_order_by_id(o.id)
+                log.info(f"Canceled open order {o.id} for {symbol}")
+            except Exception as e:
+                log.warning(f"Failed cancel {o.id} for {symbol}: {e}")
+
+
+def close_position_for_symbol(symbol: str):
+    try:
+        trading.close_position(symbol)
+        log.info(f"Close position sent for {symbol}")
+    except Exception as e:
+        # If no position exists, Alpaca throws; that’s OK
+        msg = str(e).lower()
+        if "position does not exist" in msg or "404" in msg:
+            log.info(f"No position to close for {symbol}")
+        else:
+            log.warning(f"Error closing {symbol}: {e}")
+
+
+def buy_whole_balance(symbol: str):
+    price = get_latest_price(symbol)
+    cash = get_cash_available()
+    notional = cash * SAFETY_BUFFER_PCT
+    log.info(f"{symbol}: last price={price:.8f}, cash={cash:.2f}, notional target={notional:.2f}")
+
+    if notional < 1:  # too little to place
+        raise HTTPException(status_code=400, detail="Not enough cash to place order.")
+
+    if is_crypto_symbol(symbol):
+        qty = round(notional / price, CRYPTO_QTY_DECIMALS)
+        if qty <= 0:
+            raise HTTPException(status_code=400, detail="Computed crypto qty <= 0")
+        order = MarketOrderRequest(
+            symbol=symbol,
+            qty=str(qty),
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce[TIME_IN_FORCE]
+        )
+        placed = trading.submit_order(order)
+        log.info(f"BUY CRYPTO {symbol} qty={qty} (≈${notional:.2f}) order_id={placed.id}")
+        return placed.id
+    else:
+        if FRACTIONAL_SHARES:
+            # Fractional equities: use notional
+            order = MarketOrderRequest(
+                symbol=symbol,
+                notional=round(notional, 2),
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce[TIME_IN_FORCE]
+            )
+            placed = trading.submit_order(order)
+            log.info(f"BUY EQUITY (fractional) {symbol} notional=${notional:.2f} order_id={placed.id}")
+            return placed.id
+        else:
+            # Whole shares
+            qty = math.floor(notional / price)
+            if qty < 1:
+                raise HTTPException(status_code=400, detail="Not enough for 1 whole share; enable FRACTIONAL_SHARES.")
+            order = MarketOrderRequest(
+                symbol=symbol,
+                qty=str(qty),
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce[TIME_IN_FORCE]
+            )
+            placed = trading.submit_order(order)
+            log.info(f"BUY EQUITY {symbol} qty={qty} (≈${qty*price:.2f}) order_id={placed.id}")
+            return placed.id
+
+
+def verify_secret(body_bytes: bytes, signature: Optional[str]) -> None:
     """
-    BUY: full leverage (balance * leverage)
-    SELL: reserve RESERVE_RATIO (%) of margin
+    Supports either:
+    - Raw shared secret sent in payload JSON ("secret": "..."), or
+    - HMAC-SHA256 signature in header 'X-Signature' over raw body, using WEBHOOK_SECRET as key.
     """
-    factor = Decimal("1.0") if side == "BUY" else (Decimal("1.0") - RESERVE_RATIO)
-    usable = balance * LEVERAGE * factor
-    raw_units = usable / price
-    # round down to whole units
-    return int(raw_units.quantize(Decimal("1"), rounding=ROUND_DOWN)) * (1 if side == "BUY" else -1)
+    if not WEBHOOK_SECRET:
+        return  # disabled validation (not recommended)
+    if signature:
+        digest = hmac.new(WEBHOOK_SECRET.encode(), body_bytes, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(digest, signature):
+            raise HTTPException(status_code=401, detail="Invalid signature")
+    else:
+        # We'll check JSON field in endpoint handler
+        pass
 
-def place_order(pair: str, units: int) -> dict:
-    order_payload = {
-        "order": {
-            "units": str(units),
-            "instrument": pair,
-            "timeInForce": "FOK",
-            "type": "MARKET",
-            "positionFill": "DEFAULT"
-        }
-    }
 
-    # attach SL/TP if configured
-    if STOP_LOSS_PIPS > 0:
-        distance_sl = str((STOP_LOSS_PIPS / Decimal("10000")).quantize(Decimal("0.00001")))
-        order_payload["order"]["stopLossOnFill"] = {"distance": distance_sl}
-    if TAKE_PROFIT_PIPS > 0:
-        distance_tp = str((TAKE_PROFIT_PIPS / Decimal("10000")).quantize(Decimal("0.00001")))
-        order_payload["order"]["takeProfitOnFill"] = {"distance": distance_tp}
+def idempotent(key: str) -> bool:
+    # returns True if fresh; False if duplicate
+    now = time.time()
+    # purge old
+    to_del = [k for k, v in PROCESSED_IDS.items() if now - v > IDEMPOTENCY_TTL_SEC]
+    for k in to_del:
+        PROCESSED_IDS.pop(k, None)
+    if key in PROCESSED_IDS:
+        return False
+    PROCESSED_IDS[key] = now
+    return True
 
-    r = requests.post(f"{BASE_URL}/orders", headers=HEADERS, json=order_payload, timeout=10)
-    r.raise_for_status()
-    return r.json()
 
-# ── ROUTES ──────────────────────────────────────────────
+class TVAlert(BaseModel):
+    # Minimal alert schema; add any fields you use from TradingView
+    action: str = Field(..., description="BUY or SELL")
+    symbol: Optional[str] = Field(None, description="e.g., ETHUSD, AAPL")
+    secret: Optional[str] = Field(None, description="shared secret (if not using header HMAC)")
+    id: Optional[str] = Field(None, description="unique id per-bar for idempotency")
 
-# Health-check / landing page
-@app.route("/", methods=["GET"])
-def home():
-    return "✅ OANDA webhook trading bot is live."
 
-# Accept POSTs on both "/" and "/webhook"
-@app.route("/", methods=["POST"])
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json(force=True)
-    side = data.get("signal", "").upper()
-    pair = data.get("symbol", DEFAULT_PAIR)
+@app.get("/health")
+def health():
+    return {"ok": True}
 
-    if side not in ("BUY", "SELL"):
-        return jsonify({"error": "Missing or invalid signal: must be BUY or SELL"}), 400
+
+@app.post("/webhook")
+async def webhook(req: Request):
+    raw = await req.body()
+    verify_secret(raw, req.headers.get("X-Signature"))
 
     try:
-        logging.info(f"📩 Signal received: {side} {pair}")
-        # flatten existing positions first
-        close_all_positions(pair)
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
-        # fetch current price & balance
-        price   = get_price(pair)
-        balance = get_balance()
+    tv = TVAlert(**payload)
 
-        # calculate and place the trade
-        units  = calculate_units(balance, price, side)
-        result = place_order(pair, units)
+    # If not using header HMAC, enforce body secret
+    if WEBHOOK_SECRET and not req.headers.get("X-Signature"):
+        if not tv.secret or tv.secret != WEBHOOK_SECRET:
+            raise HTTPException(status_code=401, detail="Invalid secret")
 
-        logging.info(f"✅ Executed {side} {units} units on {pair}")
-        return jsonify({
-            "status": f"Executed {side}",
-            "pair":   pair,
-            "units":  units,
-            "order":  result.get("orderCreateTransaction", {})
-        }), 200
+    symbol = (tv.symbol or DEFAULT_SYMBOL).upper()
+    action = tv.action.strip().upper()
 
-    except Exception as e:
-        logging.exception("❌ Trade execution failed")
-        return jsonify({"error": str(e)}), 500
+    # Idempotency (strongly recommended to include {{time}} or bar id from TV)
+    idem_key = f"{symbol}:{action}:{tv.id or payload.get('time') or ''}"
+    if tv.id or payload.get('time'):
+        if not idempotent(idem_key):
+            log.info(f"Duplicate alert ignored: {idem_key}")
+            return {"status": "duplicate_ignored"}
 
-# ── ENTRY POINT ────────────────────────────────────────
+    if action not in ("BUY", "SELL"):
+        raise HTTPException(status_code=400, detail="action must be BUY or SELL")
+
+    # Common hygiene
+    cancel_open_orders_for_symbol(symbol)
+
+    if action == "SELL":
+        close_position_for_symbol(symbol)
+        return {"status": "ok", "did": "close_position", "symbol": symbol}
+
+    # BUY flow
+    if CLOSE_ALL_ON_BUY:
+        try:
+            trading.close_all_positions(cancel_orders=True)
+            log.info("Closed ALL positions per CLOSE_ALL_ON_BUY=true")
+        except Exception as e:
+            log.warning(f"close_all_positions error: {e}")
+
+    # Always ensure this symbol is clean before buying
+    close_position_for_symbol(symbol)
+    order_id = buy_whole_balance(symbol)
+    return {"status": "ok", "did": "buy", "symbol": symbol, "order_id": str(order_id)}
+
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=False)

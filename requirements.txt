@@ -1,5 +1,4 @@
-flask
-requests
-gunicorn
-oandapyV20
-six
+fastapi==0.115.5
+uvicorn[standard]==0.30.6
+alpaca-py==0.20.3
+pydantic==2.8.2
